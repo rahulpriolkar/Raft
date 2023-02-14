@@ -26,7 +26,13 @@ public class Raft {
     }
 
     private String candidateId;
-    private LogEntry[] log;
+    private ArrayList<LogEntry> log = new ArrayList<LogEntry>();
+    public int getLastLogIndex() {
+        return this.log.size()-1;
+    }
+    public long getLastLogTerm() {
+        return getLastLogIndex() >= 0 ? this.log.get(getLastLogIndex()).getTerm() : -1;
+    }
 
     // all nodes (volatile)
     private long commitIndex;
@@ -202,7 +208,12 @@ public class Raft {
             // wait for majority response
             raftClients.forEach((client) -> {
                 System.out.println("Requesting Vote");
-                RequestVoteRequest request = RequestVoteRequest.newBuilder().setCandidateId("0").setTerm(currentTerm).setLastLogTerm(0).setLastLogIndex(0).build();
+                RequestVoteRequest request = RequestVoteRequest.newBuilder()
+                        .setCandidateId("0")
+                        .setTerm(currentTerm)
+                        .setLastLogTerm(getLastLogTerm())
+                        .setLastLogIndex(getLastLogIndex())
+                        .build();
                 client.requestVote(request);
 
                 // what's the difference between the above and below code ??

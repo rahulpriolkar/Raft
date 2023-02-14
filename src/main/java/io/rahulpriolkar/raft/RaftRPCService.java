@@ -73,13 +73,18 @@ public class RaftRPCService extends RaftRPCServiceGrpc.RaftRPCServiceImplBase {
         // Add logic to grant vote iff vote is not yet granted in current term and if the term of candidate >= current term of the node
         boolean heartbeatFlag = false;
         synchronized (raftObj) {
-            if(request.getTerm() < raftObj.getCurrentTerm() || raftObj.getHasVotedInCurrentTerm() == true) {
-                response = RequestVoteResponse.newBuilder()
-                        .setTerm(raftObj.getCurrentTerm())
-                        .setSenderPort(raftObj.getPORT())
-                        .setVoteGranted(false)
-                        .build();
-            } else {
+            boolean raftSafetyCheck; // true if the requesting node's log is at least as up-to-date as this node
+            if(request.getLastLogTerm() > raftObj.getLastLogTerm())
+                raftSafetyCheck = true;
+            else if (request.getLastLogTerm() == raftObj.getLastLogTerm()) {
+                raftSafetyCheck = request.getLastLogIndex() >= raftObj.getLastLogIndex();
+            }
+            else {
+                raftSafetyCheck = false;
+            }
+
+            if(raftSafetyCheck == true && request.getTerm() >= raftObj.getCurrentTerm() && raftObj.getHasVotedInCurrentTerm() == false) {
+
                 raftObj.setCurrentTerm(raftObj.getCurrentTerm()+1);
                 raftObj.setHasVotedInCurrentTerm(true);
                 response = RequestVoteResponse.newBuilder()
@@ -93,6 +98,12 @@ public class RaftRPCService extends RaftRPCServiceGrpc.RaftRPCServiceImplBase {
                 if(raftObj.getCurrentState() == Raft.NodeState.FOLLOWER) {
                     heartbeatFlag = true;
                 }
+            } else {
+                response = RequestVoteResponse.newBuilder()
+                        .setTerm(raftObj.getCurrentTerm())
+                        .setSenderPort(raftObj.getPORT())
+                        .setVoteGranted(false)
+                        .build();
             }
         }
 
