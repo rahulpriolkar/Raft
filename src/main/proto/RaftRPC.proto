@@ -28,6 +28,7 @@ message AppendEntriesRequest {
 message AppendEntriesResponse {
   int64 term = 1;
   bool success = 2;
+  int64 senderPort = 3;
 }
 
 message RequestVoteRequest {

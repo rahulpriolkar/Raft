@@ -4,11 +4,12 @@ import io.grpc.Channel;
 import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
 
+import java.util.HashMap;
 import java.util.concurrent.TimeUnit;
 
 public class RaftRPCClient {
     private final RaftRPCServiceGrpc.RaftRPCServiceStub stub;
-    private Raft raftObject;
+    private final Raft raftObject;
 
     public RaftRPCClient(Channel channel, Raft raftObject) {
         stub = RaftRPCServiceGrpc.newStub(channel);
@@ -31,12 +32,35 @@ public class RaftRPCClient {
 
                         // cancel initiate election // not really election is cancelled on service side
                         System.out.println("Append Entries Response: " + value.getSuccess());
-                        if(value.getSuccess() == false) {
-                            System.out.println("Converted to Follower state, Updated Current term to match the node who sent the append entry response");
-                            raftObject.setCurrentState(Raft.NodeState.FOLLOWER);
-                            raftObject.setCurrentTerm(value.getTerm());
-                            raftObject.logger.info("(" + raftObject.getPORT() + "): Converted to Follower state. Updated Term to = " + value.getTerm());
-                            raftObject.cancelAppendEntriesAll();
+                        if(!value.getSuccess()) {
+                            if(value.getTerm() > raftObject.getCurrentTerm()) {
+                                System.out.println("Converted to Follower state, Updated Current term to match the node who sent the append entry response");
+                                raftObject.setCurrentState(Raft.NodeState.FOLLOWER);
+                                raftObject.setCurrentTerm(value.getTerm());
+                                raftObject.logger.info("(" + raftObject.getPORT() + "): Converted to Follower state. Updated Term to = " + value.getTerm());
+                                raftObject.cancelAppendEntriesAll();
+                            } else {
+                                // decrement nextIndex for the follower node
+                                HashMap<Integer, Integer> nextIndex = raftObject.getNextIndex();
+                                nextIndex.put((int)value.getSenderPort(), nextIndex.get(value.getSenderPort()-1));
+                                raftObject.setNextIndex(nextIndex);
+                            }
+                        } else { // AppendEntries Success
+//                             increment nextIndex by the number of log entries appended to the Follower's log
+                            try {
+                                HashMap<Integer, Integer> nextIndex = raftObject.getNextIndex();
+                                // appendEntries hangs if the 2nd arg to "put" is not typecast to "int"
+                                nextIndex.put((int)value.getSenderPort(), nextIndex.get((int)value.getSenderPort()) + request.getEntriesList().size());
+                                raftObject.setNextIndex(nextIndex);
+
+                                // set matchIndex = nextIndex for the Follower
+                                HashMap<Integer, Integer> matchIndex = raftObject.getMatchIndex();
+                                matchIndex.put((int)value.getSenderPort(), nextIndex.get(value.getSenderPort()));
+                                raftObject.setMatchIndex(matchIndex);
+                            } catch (Exception e) {
+                                e.printStackTrace();
+                            }
+
                         }
                     }
                 }
@@ -44,6 +68,7 @@ public class RaftRPCClient {
                 @Override
                 public void onError(Throwable t) {
                     System.out.println(t.getMessage());
+//                    t.printStackTrace();
                 }
 
                 @Override
@@ -61,7 +86,6 @@ public class RaftRPCClient {
             stub.withDeadlineAfter(this.raftObject.getElectionTimeout(), TimeUnit.SECONDS).requestVote(request, new StreamObserver<RequestVoteResponse>() {
                 @Override
                 public void onNext(RequestVoteResponse value) {
-                    System.out.println("Received requestVote Response from " + value.getSenderPort() + "(term= " + value.getTerm() + ")" + " vote: " + value.getVoteGranted());
 
                     // Candidate received a valid append entry from a new leader and moved to FOLLOWER state
                     // Ignore the rest of the requestVote responses
@@ -74,9 +98,11 @@ public class RaftRPCClient {
                         raftObject.setVotesReceived(raftObject.getVotesReceived() + 1);
                     }
 
-                    raftObject.logger.info("(" + raftObject.getPORT() + "): Received RequestVote Response from " + value.getSenderPort() + "(term= " + value.getTerm() + ")" + " vote: " + value.getVoteGranted() + " Total Votes = " + raftObject.getVotesReceived());
 
                     synchronized (raftObject) {
+                        System.out.println("Received requestVote Response from " + value.getSenderPort() + "(term= " + value.getTerm() + ")" + " vote: " + value.getVoteGranted());
+                        raftObject.logger.info("(" + raftObject.getPORT() + "): Received RequestVote Response from " + value.getSenderPort() + "(term= " + value.getTerm() + ")" + " vote: " + value.getVoteGranted() + " Total Votes = " + raftObject.getVotesReceived());
+
                         if(raftObject.getCurrentState() != Raft.NodeState.LEADER && raftObject.getVotesReceived() > raftObject.getServerCount() / 2) {
                             // Declare current server the leader
 //                            if(raftObject.getCurrentState() !=  Raft.NodeState.LEADER) {

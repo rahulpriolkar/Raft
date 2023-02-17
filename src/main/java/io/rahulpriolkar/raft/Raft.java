@@ -1,15 +1,12 @@
 package io.rahulpriolkar.raft;
 
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.Server;
-import io.grpc.ServerBuilder;
+import io.grpc.*;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.List;
+import java.util.HashMap;
 import java.util.Random;
 import java.util.concurrent.*;
 
@@ -26,7 +23,14 @@ public class Raft {
     }
 
     private String candidateId;
-    private ArrayList<LogEntry> log = new ArrayList<LogEntry>();
+    private ArrayList<LogEntry> log = new ArrayList<>();
+    public ArrayList<LogEntry> getLog() {
+        return this.log;
+    }
+    public void setLog(ArrayList<LogEntry> newLog) {
+        this.log = newLog;
+    }
+
     public int getLastLogIndex() {
         return this.log.size()-1;
     }
@@ -35,12 +39,43 @@ public class Raft {
     }
 
     // all nodes (volatile)
-    private long commitIndex;
-    private long lastApplied;
+    private int commitIndex = -1;
+    private int lastApplied = -1;
 
     // leader
-    private long[] nextIndex;
-    private long[] matchIndex;
+    private HashMap<Integer, Integer> nextIndex = new HashMap<>();
+    private HashMap<Integer, Integer> matchIndex = new HashMap<>();
+
+    public HashMap<Integer, Integer> getNextIndex() {
+        return nextIndex;
+    }
+    public HashMap<Integer, Integer> getMatchIndex() {
+        return matchIndex;
+    }
+    public void setNextIndex(HashMap<Integer, Integer> newNextIndex) {
+        this.nextIndex = newNextIndex;
+    }
+    public void setMatchIndex(HashMap<Integer, Integer> newMatchIndex) {
+        this.matchIndex = newMatchIndex;
+    }
+
+    private void initNextIndex() {
+        for(int i = 0; i < this.neighbors.length; i++) {
+            this.nextIndex.put(this.neighbors[i], this.getLastLogIndex()+1);
+        }
+    }
+    private void initMatchIndex() {
+        for(int i = 0; i < this.neighbors.length; i++) {
+            this.nextIndex.put(this.neighbors[i], 0);
+        }
+    }
+
+    private Integer getPrevLogIndex(Integer id) {
+        return this.nextIndex.get(id) - 1;
+    }
+    private long getPrevLogTerm(Integer id) {
+        return getPrevLogIndex(id) >= 0 ? this.log.get(getPrevLogIndex(id)).getTerm() : -1;
+    }
 
     private int votesReceived = 0;
     public int getVotesReceived() {
@@ -67,13 +102,14 @@ public class Raft {
 
     // ELECTION TIMEOUT
     Random generator = new Random();
-    private long electionTimeout = 12;
+    private long electionTimeout = 5;
     public long getElectionTimeout() {
         return electionTimeout;
     }
 
     // SERVER COUNT
-    // Should be able to change dynamically if more servers are added // IMPORTANT
+    // TODO
+    // Should be able to change dynamically if more servers are added // IMPORTANT (Add Functionality)
     private int serverCount = 5;
     public int getServerCount() {
         return this.serverCount;
@@ -91,14 +127,21 @@ public class Raft {
         return this.currentState;
     }
     public void setCurrentState(NodeState state) {
+        // Initialize NextIndex and MatchIndex
+        // This is set on starting the node or when the node wins the election
+        if(state == NodeState.LEADER) {
+            initNextIndex();
+            initMatchIndex();
+        }
         this.currentState = state;
     }
 
+    // stores just the PORTs of the neighbors
     private int[] neighbors = null;
 
     RaftRPCService raftRPCService = new RaftRPCService(this);
 
-    List<RaftRPCClient> raftClients = new ArrayList<RaftRPCClient>();
+    HashMap<Integer, RaftRPCClient> raftClients = new HashMap<Integer, RaftRPCClient>();
     private RaftRPCClient createRaftClient(int targetPort) {
         ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", targetPort)
                 .usePlaintext()
@@ -127,8 +170,8 @@ public class Raft {
 
     public Raft(NodeState state, int port, int[] neighbors) throws InterruptedException, IOException {
         this.PORT = port;
-        this.currentState = state;
         this.neighbors = neighbors;
+        this.setCurrentState(state);
 
         System.out.println("Election Timeout = " + this.electionTimeout);
 
@@ -137,8 +180,8 @@ public class Raft {
         startRaftServerFuture = executorService.submit(startRaftServerRunnableObj);
 
         // creating a raft client with all other servers, for dedicated communication
-        for(int i = 0; i < this.neighbors.length; i++) {
-            this.raftClients.add(this.createRaftClient(this.neighbors[i]));
+        for (int neighbor : this.neighbors) {
+            this.raftClients.put(neighbor, this.createRaftClient(neighbor));
         }
 
         try {
@@ -167,7 +210,7 @@ public class Raft {
     }
 
     private class CallRequestVote implements Runnable {
-        private RaftRPCClient client;
+        private final RaftRPCClient client;
         CallRequestVote(RaftRPCClient client) {
             this.client = client;
         }
@@ -200,13 +243,11 @@ public class Raft {
 //            this.cancelElection(); // for split votes, the previous election also needs to be cancelled, but after
             // electionTimeout has passed (so cant be done in heartbeat, when the next initiateElection is scheduled)
             heartbeat(false); // call heartbeat to initiate new election if no result to the below requestVote RPCs after
-            // "electionTimeout" has passed
-
 
             // TODO
             // requestVote RPC in parallel to all available servers
             // wait for majority response
-            raftClients.forEach((client) -> {
+            for(int key: raftClients.keySet()) {
                 System.out.println("Requesting Vote");
                 RequestVoteRequest request = RequestVoteRequest.newBuilder()
                         .setCandidateId("0")
@@ -214,11 +255,11 @@ public class Raft {
                         .setLastLogTerm(getLastLogTerm())
                         .setLastLogIndex(getLastLogIndex())
                         .build();
-                client.requestVote(request);
+                raftClients.get(key).requestVote(request);
 
                 // what's the difference between the above and below code ??
 //                electionExecutorService.schedule(new CallRequestVote(client), 0, TimeUnit.SECONDS);
-            });
+            }
         }
     }
 
@@ -227,20 +268,25 @@ public class Raft {
         public void run() {
             System.out.println("Sending Append Entries heartbeat");
             // send appendEntries RPC in (parallel ??) to all available servers
-            AppendEntriesRequest request = AppendEntriesRequest.newBuilder()
-                                                .setTerm(currentTerm)
-                                                .setSenderPort(getPORT())
-                                                .build();
+
             // check if each api call is blocking (IMPORTANT)
-            raftClients.forEach((client) -> {
-                client.appendEntries(request);
-            });
+            for(int key: raftClients.keySet()) {
+                AppendEntriesRequest request = AppendEntriesRequest.newBuilder()
+                        .setTerm(currentTerm)
+                        .setPrevLogIndex(getPrevLogIndex(key))
+                        .setPrevLogTerm(getPrevLogTerm(key))
+                        .addAllEntries(log)
+                        .setCommitIndex(commitIndex)
+                        .setSenderPort(getPORT())
+                        .build();
+                raftClients.get(key).appendEntries(request);
+            }
         }
     }
 
     public void cancelAppendEntriesAll() {
         // check how cancel works if the runnable task is already being executed
-        if(this.appendEntriesAllFuture != null && this.appendEntriesAllFuture.isCancelled() == false) {
+        if(this.appendEntriesAllFuture != null && !this.appendEntriesAllFuture.isCancelled()) {
             this.appendEntriesAllFuture.cancel(true);
         }
         this.appendEntriesAllFuture = null;
@@ -257,7 +303,7 @@ public class Raft {
                 this.currentElectionFuture = this.nextElectionFuture;
                 this.currentElectionRunnableObj = this.nextElectionRunnableObj;
 
-                if(this.currentElectionFuture != null && this.currentElectionFuture.isCancelled() == false) {
+                if(this.currentElectionFuture != null && !this.currentElectionFuture.isCancelled()) {
                     // cancels an ongoing election, only if an appendEntries RPC is received
                     if(cancelPreviousElection)
                         this.currentElectionRunnableObj.cancelElection();
@@ -268,7 +314,7 @@ public class Raft {
 
                 System.out.println("Starting append entries");
                 // This schedule is not getting cancelled ? (think it did)
-                this.appendEntriesAllFuture =  executorService.scheduleAtFixedRate(new appendEntriesAll(), 0, 5, TimeUnit.SECONDS);
+                this.appendEntriesAllFuture =  executorService.scheduleAtFixedRate(new appendEntriesAll(), 0, 1, TimeUnit.SECONDS);
                 break;
 
             default: // FOLLOWER or CANDIDATE
@@ -280,11 +326,10 @@ public class Raft {
                 // or in case of a split vote (cancelled from initiate election)
                 // election is cancelled from
                 // before starting a new one after "electionTimeout" time has passed
-
                 this.currentElectionFuture = this.nextElectionFuture;
                 this.currentElectionRunnableObj = this.nextElectionRunnableObj;
 
-                if(this.currentElectionFuture != null && this.currentElectionFuture.isCancelled() == false) {
+                if(this.currentElectionFuture != null && !this.currentElectionFuture.isCancelled()) {
                     // cancels an ongoing election, only if an appendEntries RPC is received
                     if(cancelPreviousElection)
                         this.currentElectionRunnableObj.cancelElection(); // cancels election which has already begun ??
@@ -294,9 +339,6 @@ public class Raft {
                     // and has scheduled an election
                     System.out.println("Cancelled Election");
                 }
-
-                // start an election, after electionTimeout has passed
-                // schedules new future
 
                 // does this reassignment destroy the existing executor service in the previous object ??
                 // I think it does!!
@@ -312,23 +354,5 @@ public class Raft {
 
                 break;
         }
-    }
-
-    public static void main(String[] args) throws IOException, InterruptedException {
-//        String timeStamp = new SimpleDateFormat("yyyy.MM.dd.HH.mm.ss").format(new java.util.Date());
-//        final int PORT = 5001;
-//        System.out.println("Hello");
-//        ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", PORT)
-//                .usePlaintext()
-//                .build();
-//        RaftRPCClient raftRPCClient = new RaftRPCClient(channel);
-//        Raft raftObj = new Raft(NodeState.FOLLOWER, PORT);
-//        RaftRPCService raftRPCService = new RaftRPCService(raftObj);
-//        Server raftRPCServer = ServerBuilder.forPort(PORT)
-//                .addService(raftRPCService)
-//                .build()
-//                .start();
-//        raftRPCServer.awaitTermination();
-
     }
 }

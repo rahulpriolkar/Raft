@@ -2,8 +2,10 @@ package io.rahulpriolkar.raft;
 
 import io.grpc.stub.StreamObserver;
 
+import java.util.ArrayList;
+
 public class RaftRPCService extends RaftRPCServiceGrpc.RaftRPCServiceImplBase {
-    private Raft raftObj;
+    private final Raft raftObj;
     
     public RaftRPCService(Raft raft) {
         this.raftObj = raft;
@@ -11,10 +13,8 @@ public class RaftRPCService extends RaftRPCServiceGrpc.RaftRPCServiceImplBase {
 
     @Override
     public void appendEntries(AppendEntriesRequest request, StreamObserver<AppendEntriesResponse> responseObserver) {
-        AppendEntriesResponse response = null;
-        // implement logic (updating log etc)
-
-        // the receiving node could be a FOLLOWER, or might ha ve already
+        AppendEntriesResponse response;
+        // the receiving node could be a FOLLOWER, or might have already
         // timed out, moved to CANDIDATE and started an election
 
         // But appendEntriesRPC will always come from the leader (Actual leader or a node which believes it is a leader
@@ -29,22 +29,49 @@ public class RaftRPCService extends RaftRPCServiceGrpc.RaftRPCServiceImplBase {
         //    Else if its valid then cancel the election, and move to follower state
         // Should add logic to ignore responses to already sent request Votes ?
 
+        // if receiver has higher term than the Leader
+        boolean condition1 = request.getTerm() < this.raftObj.getCurrentTerm();
+
+        // if the receiver's log is not large enough to contain prevLogIndex
+        boolean condition2 = request.getPrevLogIndex() > -1
+                && request.getPrevLogIndex() >= raftObj.getLog().size();
+
+        // if the entry in the receiver's log, at prevLogIndex has term != prevLogTerm
+        boolean condition3 = request.getPrevLogIndex() > -1
+                && raftObj.getLog().size() > request.getPrevLogIndex() // check if index is out of bounds
+                && raftObj.getLog().get(request.getPrevLogIndex()).getTerm() != request.getPrevLogTerm();
+
         // Must check term to validate if the sending node is LEADER. (Add Logic)
-        if(request.getTerm() < this.raftObj.getCurrentTerm()) {
+        if(condition1 || condition2 || condition3) {
             raftObj.logger.info("(" + raftObj.getPORT() + ") : Received Append Entry - [Rejected] Sender(" + request.getSenderPort() + ") Term = " + request.getTerm() + " Current Term = " + raftObj.getCurrentTerm());
             response = AppendEntriesResponse.newBuilder()
                     .setTerm(this.raftObj.getCurrentTerm())
                     .setSuccess(false)
                     .build();
-        } else {
+        } else { // This else is reached only if the prevLogTerm at prevLogIndex matches or if prevLogIndex = -1
+
+            // add logic to delete existing log entries after prevLogIndex
+            // (Should this be done in the previous else-if, as we find each mismatch ??)
+            // and append the Leader's log entries
+            ArrayList<LogEntry> log = raftObj.getLog();
+
+            // remove entries after prevLogIndex, if they exist
+            if(raftObj.getLog().size() > request.getPrevLogIndex()+1) { // is this if condition necessary ? - Yes
+                log = (ArrayList<LogEntry>) log.subList(request.getPrevLogIndex()+1, log.size());
+            }
+
+            log.addAll(request.getEntriesList());
+
+
             System.out.println("Cancelling Election! Received Append Entry from " + request.getSenderPort() + "(" + request.getTerm() + ")!");
             raftObj.logger.info("(" + raftObj.getPORT() + ") : Received Append Entry - [Accepted] Sender(" + request.getSenderPort() + ")  Term = " + request.getTerm() + " Current Term = " + raftObj.getCurrentTerm());
             response = AppendEntriesResponse.newBuilder()
                     .setTerm(this.raftObj.getCurrentTerm())
                     .setSuccess(true)
+                    .setSenderPort(raftObj.getPORT())
                     .build();
 
-            // This is wrong, this is a receiver
+            // This is wrong, this is a receiver ?
             if(this.raftObj.getCurrentState() == Raft.NodeState.LEADER) {
                 // cancel the previous heartbeats as a new leader with a higher term has been detected
                 this.raftObj.cancelAppendEntriesAll();
@@ -83,7 +110,8 @@ public class RaftRPCService extends RaftRPCServiceGrpc.RaftRPCServiceImplBase {
                 raftSafetyCheck = false;
             }
 
-            if(raftSafetyCheck == true && request.getTerm() >= raftObj.getCurrentTerm() && raftObj.getHasVotedInCurrentTerm() == false) {
+//            System.out.println("Raft Safety Check: " + raftSafetyCheck);
+            if(raftSafetyCheck && request.getTerm() >= raftObj.getCurrentTerm() && !raftObj.getHasVotedInCurrentTerm()) {
 
                 raftObj.setCurrentTerm(raftObj.getCurrentTerm()+1);
                 raftObj.setHasVotedInCurrentTerm(true);
@@ -106,7 +134,6 @@ public class RaftRPCService extends RaftRPCServiceGrpc.RaftRPCServiceImplBase {
                         .build();
             }
         }
-
 
         responseObserver.onNext(response);
         responseObserver.onCompleted();
