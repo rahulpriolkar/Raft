@@ -62,7 +62,6 @@ public class RaftRPCService extends RaftRPCServiceGrpc.RaftRPCServiceImplBase {
 
             log.addAll(request.getEntriesList());
 
-
             System.out.println("Cancelling Election! Received Append Entry from " + request.getSenderPort() + "(" + request.getTerm() + ")!");
             raftObj.logger.info("(" + raftObj.getPORT() + ") : Received Append Entry - [Accepted] Sender(" + request.getSenderPort() + ")  Term = " + request.getTerm() + " Current Term = " + raftObj.getCurrentTerm());
             response = AppendEntriesResponse.newBuilder()
@@ -77,7 +76,10 @@ public class RaftRPCService extends RaftRPCServiceGrpc.RaftRPCServiceImplBase {
                 this.raftObj.cancelAppendEntriesAll();
             }
 
-            // Moving to Follower state
+            // Update currentTerm to match Leader's term and convert node to Follower state
+            if(raftObj.getCurrentTerm() < request.getTerm()) {
+                raftObj.setCurrentTerm(request.getTerm());
+            }
             this.raftObj.setCurrentState(Raft.NodeState.FOLLOWER);
             this.raftObj.heartbeat(true); // should this heartbeat be called after onNext ?
         }
@@ -113,7 +115,16 @@ public class RaftRPCService extends RaftRPCServiceGrpc.RaftRPCServiceImplBase {
 //            System.out.println("Raft Safety Check: " + raftSafetyCheck);
             if(raftSafetyCheck && request.getTerm() >= raftObj.getCurrentTerm() && !raftObj.getHasVotedInCurrentTerm()) {
 
-                raftObj.setCurrentTerm(raftObj.getCurrentTerm()+1);
+//                raftObj.setCurrentTerm(raftObj.getCurrentTerm()+1);
+
+                // Check if this is correct
+                // if vote granted to a higher term candidate, then update currentTerm to match the Candidate's term
+                // and move to Follower state
+                if(request.getTerm() > raftObj.getCurrentTerm()) {
+                    raftObj.setCurrentTerm(request.getTerm());
+                    raftObj.setCurrentState(Raft.NodeState.FOLLOWER);
+                }
+
                 raftObj.setHasVotedInCurrentTerm(true);
                 response = RequestVoteResponse.newBuilder()
                         .setTerm(raftObj.getCurrentTerm())

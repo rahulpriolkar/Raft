@@ -39,6 +39,9 @@ public class RaftRPCClient {
                                 raftObject.setCurrentTerm(value.getTerm());
                                 raftObject.logger.info("(" + raftObject.getPORT() + "): Converted to Follower state. Updated Term to = " + value.getTerm());
                                 raftObject.cancelAppendEntriesAll();
+
+                                // Must call heartbeat as the node has been converted to a Follower
+                                raftObject.heartbeat(false);
                             } else {
                                 // decrement nextIndex for the follower node
                                 HashMap<Integer, Integer> nextIndex = raftObject.getNextIndex();
@@ -87,28 +90,31 @@ public class RaftRPCClient {
                 @Override
                 public void onNext(RequestVoteResponse value) {
 
-                    // Candidate received a valid append entry from a new leader and moved to FOLLOWER state
-                    // Ignore the rest of the requestVote responses
-                    if(raftObject.getCurrentState() == Raft.NodeState.FOLLOWER) {
-                        return;
-                    }
-
-                    // Add logic to check if the votes received are majority
-                    if(value.getVoteGranted()) {
-                        raftObject.setVotesReceived(raftObject.getVotesReceived() + 1);
-                    }
-
-
                     synchronized (raftObject) {
+                        // Candidate received a valid append entry from a new leader and moved to FOLLOWER state
+                        // Ignore the rest of the requestVote responses
+                        if(raftObject.getCurrentState() == Raft.NodeState.FOLLOWER) {
+                            return;
+                        }
+
                         System.out.println("Received requestVote Response from " + value.getSenderPort() + "(term= " + value.getTerm() + ")" + " vote: " + value.getVoteGranted());
                         raftObject.logger.info("(" + raftObject.getPORT() + "): Received RequestVote Response from " + value.getSenderPort() + "(term= " + value.getTerm() + ")" + " vote: " + value.getVoteGranted() + " Total Votes = " + raftObject.getVotesReceived());
 
+                        // Update currentTerm
+                        if(value.getTerm() > raftObject.getCurrentTerm()) {
+                            raftObject.setCurrentTerm(value.getTerm());
+                            // return // can return here
+                        }
+
+                        // Add logic to check if the votes received are majority
+                        if(value.getVoteGranted()) {
+                            raftObject.setVotesReceived(raftObject.getVotesReceived() + 1);
+                        }
+
                         if(raftObject.getCurrentState() != Raft.NodeState.LEADER && raftObject.getVotesReceived() > raftObject.getServerCount() / 2) {
                             // Declare current server the leader
-//                            if(raftObject.getCurrentState() !=  Raft.NodeState.LEADER) {
-                                System.out.println("ELECTED AS LEADER! current term = " + raftObject.getCurrentTerm());
-                                raftObject.logger.info("(" + raftObject.getPORT() + ") : Elected As LEADER!");
-//                            }
+                            System.out.println("ELECTED AS LEADER! current term = " + raftObject.getCurrentTerm());
+                            raftObject.logger.info("(" + raftObject.getPORT() + ") : Elected As LEADER!");
 
                             // cancel ongoing/scheduled initiateElection after getting elected a leader
                             raftObject.setCurrentState(Raft.NodeState.LEADER);
