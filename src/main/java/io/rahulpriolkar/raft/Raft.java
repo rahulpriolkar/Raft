@@ -1,17 +1,36 @@
 package io.rahulpriolkar.raft;
 
-import io.grpc.*;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpHandler;
+import com.sun.net.httpserver.HttpServer;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.Server;
+import io.grpc.ServerBuilder;
+import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Random;
+import java.io.InputStream;
+import java.net.InetSocketAddress;
+import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class Raft {
     public Logger logger = LogManager.getLogger(Raft.class.getName());
+
+    // Http Server
+    private HashMap<Integer, HttpExchange> clientMappings = new HashMap<>();
+
+    // State Machine
+    private StateMachine stateMachine = new StateMachine();
+
+    ReadWriteLock lock = new ReentrantReadWriteLock();
+
 
     // all nodes (persistent)
     private long currentTerm = 0;
@@ -23,12 +42,25 @@ public class Raft {
     }
 
     private String candidateId;
-    private ArrayList<LogEntry> log = new ArrayList<>();
+
+    LogEntry defaultLogEntry = LogEntry.newBuilder()
+            .setTerm(-1)
+            .setKey("default")
+            .setValue("-1")
+            .build();
+    private ArrayList<LogEntry> log = new ArrayList<>(Collections.nCopies(0, defaultLogEntry));
     public ArrayList<LogEntry> getLog() {
         return this.log;
     }
     public void setLog(ArrayList<LogEntry> newLog) {
         this.log = newLog;
+    }
+
+    public void displayLog() {
+        for(int i = 0; i <= getLastLogIndex(); i++) {
+            System.out.print(log.get(i).getValue() + " ");
+        }
+        System.out.println();
     }
 
     public int getLastLogIndex() {
@@ -41,6 +73,13 @@ public class Raft {
     // all nodes (volatile)
     private int commitIndex = -1;
     private int lastApplied = -1;
+
+    public int getCommitIndex() {
+        return this.commitIndex;
+    }
+    public void setCommitIndex(int index) {
+        this.commitIndex = index;
+    }
 
     // leader
     private HashMap<Integer, Integer> nextIndex = new HashMap<>();
@@ -60,13 +99,13 @@ public class Raft {
     }
 
     private void initNextIndex() {
-        for(int i = 0; i < this.neighbors.length; i++) {
-            this.nextIndex.put(this.neighbors[i], this.getLastLogIndex()+1);
+        for (int neighbor : this.neighbors) {
+            this.nextIndex.put(neighbor, this.getLastLogIndex() + 1);
         }
     }
     private void initMatchIndex() {
-        for(int i = 0; i < this.neighbors.length; i++) {
-            this.nextIndex.put(this.neighbors[i], 0);
+        for (int neighbor : this.neighbors) {
+            this.matchIndex.put(neighbor, -1); // should be initialized to -1 or 0 ??
         }
     }
 
@@ -95,14 +134,14 @@ public class Raft {
     }
 
     // PORT
-    private int PORT;
+    private final int PORT;
     public int getPORT() {
         return PORT;
     }
 
     // ELECTION TIMEOUT
     Random generator = new Random();
-    private long electionTimeout = 5;
+    private final long electionTimeout = 30;
     public long getElectionTimeout() {
         return electionTimeout;
     }
@@ -137,7 +176,7 @@ public class Raft {
     }
 
     // stores just the PORTs of the neighbors
-    private int[] neighbors = null;
+    private int[] neighbors;
 
     RaftRPCService raftRPCService = new RaftRPCService(this);
 
@@ -150,7 +189,7 @@ public class Raft {
     }
 
     // EXECUTOR SERVICE - RUNS THE RAFT SERVER, APPEND ENTRIES, INITIATE ELECTION TASKS
-    private ScheduledExecutorService executorService = Executors.newScheduledThreadPool(3);
+    private ScheduledExecutorService executorService = Executors.newScheduledThreadPool(4);
     public ScheduledExecutorService getExecutorService() {
         return executorService;
     }
@@ -164,8 +203,11 @@ public class Raft {
     private Future appendEntriesAllFuture = null;
 
     Server raftServer = null;
-    private startRaftServer startRaftServerRunnableObj = null;
-    private Future startRaftServerFuture = null;
+    private startRaftServer startRaftServerRunnableObj;
+    private Future startRaftServerFuture;
+
+    private startHttpServer startHttpServerRunnableObj;
+    private Future startHttpServerFuture;
 
 
     public Raft(NodeState state, int port, int[] neighbors) throws InterruptedException, IOException {
@@ -178,6 +220,9 @@ public class Raft {
         // start future in a thread
         startRaftServerRunnableObj = new startRaftServer();
         startRaftServerFuture = executorService.submit(startRaftServerRunnableObj);
+
+        startHttpServerRunnableObj = new startHttpServer();
+        startHttpServerFuture = executorService.submit(startHttpServerRunnableObj);
 
         // creating a raft client with all other servers, for dedicated communication
         for (int neighbor : this.neighbors) {
@@ -201,11 +246,69 @@ public class Raft {
                         .build()
                         .start();
                 raftServer.awaitTermination();
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            } catch (InterruptedException e) {
+            } catch (IOException | InterruptedException e) {
                 throw new RuntimeException(e);
             }
+        }
+    }
+
+    private class startHttpServer implements Runnable {
+        @Override
+        public void run() {
+            HttpServer server;
+            try {
+                server = HttpServer.create(new InetSocketAddress(PORT+1000), 0);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+            server.createContext("/test", new MyHandler());
+            server.setExecutor(null); // creates a default executor
+            server.start();
+        }
+
+        class MyHandler implements HttpHandler {
+            @Override
+            public void handle(HttpExchange exchange) throws IOException {
+                logger.log(Level.valueOf("info"), "Handling HTTP Request");
+
+                LogEntry logEntry = commandToLogEntry(exchange.getRequestBody());
+
+                lock.writeLock().lock();
+                // Add command to log
+                System.out.println("Entered Critical Region");
+                log.add(logEntry);
+                // Save the OutputStream in the clientMappings (Respond with success/failure after committing) // Should happen from heartbeat
+                clientMappings.put(getLastLogIndex(), exchange);
+                lock.writeLock().unlock();
+                System.out.println("Exited Critical Region");
+
+//                exchange.sendResponseHeaders(200, res.length());
+//                OutputStream os = exchange.getResponseBody();
+//                os.write(res.getBytes());
+//                os.close();
+            }
+        }
+
+        private LogEntry commandToLogEntry(InputStream inputStream) throws IOException{
+            ByteArrayOutputStream result = new ByteArrayOutputStream();
+            byte[] buffer = new byte[1024];
+            for (int length; (length = inputStream.read(buffer)) != -1; ) {
+                result.write(buffer, 0, length);
+            }
+
+            // StandardCharsets.UTF_8.name() > JDK 7
+            String command = result.toString("UTF-8");
+            String[] keyVal = command.split("=");
+            keyVal[0] = keyVal[0].trim();
+            keyVal[1] = keyVal[1].trim();
+
+            LogEntry logEntry = LogEntry.newBuilder()
+                    .setTerm(currentTerm)
+                    .setKey(keyVal[0])
+                    .setValue(keyVal[1])
+                    .build();
+
+            return logEntry;
         }
     }
 
@@ -257,7 +360,6 @@ public class Raft {
                         .build();
                 raftClients.get(key).requestVote(request);
 
-                // what's the difference between the above and below code ??
 //                electionExecutorService.schedule(new CallRequestVote(client), 0, TimeUnit.SECONDS);
             }
         }
@@ -266,20 +368,73 @@ public class Raft {
     private class appendEntriesAll implements Runnable {
         @Override
         public void run() {
-            System.out.println("Sending Append Entries heartbeat");
-            // send appendEntries RPC in (parallel ??) to all available servers
+//            System.out.println("Sending Append Entries heartbeat");
+            displayLog();
+//            System.out.println("[After Display]: Sending Append Entries heartbeat");
+            System.out.println("raftClients size = " + raftClients.size());
 
-            // check if each api call is blocking (IMPORTANT)
+            // Update Commit Index
+            this.updateCommitIndex();
+            System.out.println("Commit Index = " + commitIndex);
+
+            // send appendEntries RPC in (parallel ??) to all available servers (Update: They are sent asynchronously,
+            // in one thread, not in parallel)
+
+            // check if each api call is blocking (IMPORTANT) (Update: It's not)
             for(int key: raftClients.keySet()) {
-                AppendEntriesRequest request = AppendEntriesRequest.newBuilder()
-                        .setTerm(currentTerm)
-                        .setPrevLogIndex(getPrevLogIndex(key))
-                        .setPrevLogTerm(getPrevLogTerm(key))
-                        .addAllEntries(log)
-                        .setCommitIndex(commitIndex)
-                        .setSenderPort(getPORT())
-                        .build();
-                raftClients.get(key).appendEntries(request);
+                try {
+                    System.out.println("NextIndex = " + nextIndex.get(key));
+                    int prevLogIndex = getPrevLogIndex(key);
+                    long prevLogTerm = getPrevLogTerm(key);
+                    System.out.println("In Append Entries, before sending request - prevLogIndex = " + prevLogIndex + " prevLogTerm = " + prevLogTerm);
+
+                    ArrayList<LogEntry> newEntries;
+                    if(log.size() > 0) newEntries = new ArrayList<>(log.subList(prevLogIndex + 1, log.size()));
+                    else newEntries = new ArrayList<>();
+
+                    AppendEntriesRequest request = AppendEntriesRequest.newBuilder()
+                            .setTerm(currentTerm)
+                            .setPrevLogIndex(getPrevLogIndex(key))
+                            .setPrevLogTerm(getPrevLogTerm(key))
+                            .addAllEntries(newEntries)
+                            .setCommitIndex(commitIndex)
+                            .setSenderPort(getPORT())
+                            .build();
+                    raftClients.get(key).appendEntries(request);
+                } catch (Exception e) {
+                    System.out.println("Error: Append Entries");
+                    e.printStackTrace();
+                }
+            }
+        }
+
+        // Test this function thoroughly
+        private void updateCommitIndex() {
+            // get the log index such that a majority of the matchIndex's are >= N and log term at index N == currentTerm
+            // Get the list of match Index values, sort them in ascending order, and get the (serverCount / 2)th value
+            try {
+                ArrayList<Integer> matchIndexVals = new ArrayList<>(matchIndex.values());
+//                System.out.println("Check: " + matchIndex.get(0));
+                System.out.println("matchIndexVals = " + matchIndexVals);
+                matchIndexVals.sort(new Comparator<Integer>() {
+                    @Override
+                    public int compare(Integer o1, Integer o2) {
+                        if (o1 < o2) return -1;
+                        if (o1 > o2) return 1;
+                        else return 0;
+                    }
+                });
+                int newCommitIndex = matchIndexVals.get((serverCount-1) / 2);
+
+                System.out.println("New Commit Index = " + newCommitIndex);
+
+                // Decrement the index until the log term at that index has the same term as the leader's currentTerm
+                // Can this go to -1 when a new leader is elected [???]
+                while(newCommitIndex > -1 && log.get(newCommitIndex).getTerm() != currentTerm)
+                    newCommitIndex--;
+                commitIndex = newCommitIndex;
+            } catch (Exception e) {
+                e.printStackTrace();
             }
         }
     }
@@ -314,11 +469,12 @@ public class Raft {
 
                 System.out.println("Starting append entries");
                 // This schedule is not getting cancelled ? (think it did)
-                this.appendEntriesAllFuture =  executorService.scheduleAtFixedRate(new appendEntriesAll(), 0, 1, TimeUnit.SECONDS);
+                this.appendEntriesAllFuture =  executorService.scheduleAtFixedRate(new appendEntriesAll(), 0, 4, TimeUnit.SECONDS);
                 break;
 
             default: // FOLLOWER or CANDIDATE
                 System.out.println("Running Heartbeat");
+                displayLog();
 
                 // implement randomized timeouts
 

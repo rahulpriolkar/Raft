@@ -14,6 +14,7 @@ public class RaftRPCService extends RaftRPCServiceGrpc.RaftRPCServiceImplBase {
     @Override
     public void appendEntries(AppendEntriesRequest request, StreamObserver<AppendEntriesResponse> responseObserver) {
         AppendEntriesResponse response;
+        System.out.println("Before Processing Append Entry");
         // the receiving node could be a FOLLOWER, or might have already
         // timed out, moved to CANDIDATE and started an election
 
@@ -29,60 +30,88 @@ public class RaftRPCService extends RaftRPCServiceGrpc.RaftRPCServiceImplBase {
         //    Else if its valid then cancel the election, and move to follower state
         // Should add logic to ignore responses to already sent request Votes ?
 
-        // if receiver has higher term than the Leader
-        boolean condition1 = request.getTerm() < this.raftObj.getCurrentTerm();
+       synchronized (raftObj) {
+            // if receiver has higher term than the Leader
+            boolean condition1 = request.getTerm() < this.raftObj.getCurrentTerm();
 
-        // if the receiver's log is not large enough to contain prevLogIndex
-        boolean condition2 = request.getPrevLogIndex() > -1
-                && request.getPrevLogIndex() >= raftObj.getLog().size();
+            // if the receiver's log is not large enough to contain prevLogIndex
+            boolean condition2 = request.getPrevLogIndex() > -1
+                    && request.getPrevLogIndex() >= raftObj.getLog().size();
 
-        // if the entry in the receiver's log, at prevLogIndex has term != prevLogTerm
-        boolean condition3 = request.getPrevLogIndex() > -1
-                && raftObj.getLog().size() > request.getPrevLogIndex() // check if index is out of bounds
-                && raftObj.getLog().get(request.getPrevLogIndex()).getTerm() != request.getPrevLogTerm();
+            // if the entry in the receiver's log, at prevLogIndex has term != prevLogTerm
+            boolean condition3 = request.getPrevLogIndex() > -1
+                    && raftObj.getLog().size() > request.getPrevLogIndex() // check if index is out of bounds
+                    && raftObj.getLog().get(request.getPrevLogIndex()).getTerm() != request.getPrevLogTerm();
 
-        // Must check term to validate if the sending node is LEADER. (Add Logic)
-        if(condition1 || condition2 || condition3) {
-            raftObj.logger.info("(" + raftObj.getPORT() + ") : Received Append Entry - [Rejected] Sender(" + request.getSenderPort() + ") Term = " + request.getTerm() + " Current Term = " + raftObj.getCurrentTerm());
-            response = AppendEntriesResponse.newBuilder()
-                    .setTerm(this.raftObj.getCurrentTerm())
-                    .setSuccess(false)
-                    .build();
-        } else { // This else is reached only if the prevLogTerm at prevLogIndex matches or if prevLogIndex = -1
+            // Must check term to validate if the sending node is LEADER. (Add Logic)
+            if(condition1 || condition2 || condition3) {
+                if(condition1) System.out.println("Condition 1");
+                if(condition2) System.out.println("Condition 2");
+                if(condition3) System.out.println("Condition 3");
+                System.out.println("Request.PrevLogIndex = " + request.getPrevLogIndex() + " RaftObj.LogSize = " + raftObj.getLog().size());
+                raftObj.logger.info("(" + raftObj.getPORT() + ") : Received Append Entry - [Rejected] Sender(" + request.getSenderPort() + ") Term = " + request.getTerm() + " Current Term = " + raftObj.getCurrentTerm());
+                response = AppendEntriesResponse.newBuilder()
+                        .setTerm(this.raftObj.getCurrentTerm())
+                        .setSuccess(false)
+                        .setSenderPort(raftObj.getPORT())
+                        .build();
 
-            // add logic to delete existing log entries after prevLogIndex
-            // (Should this be done in the previous else-if, as we find each mismatch ??)
-            // and append the Leader's log entries
-            ArrayList<LogEntry> log = raftObj.getLog();
+                // Must call heartbeat here (Leads to duplicate appendEntriesAll call, everytime an appendEntryRequest
+                // is received from a past LEADER that just came back online)
+                // => Quick Fix: Call heartbeat on a failure iff current Node is not a leader
+                // This happens because the appendEntriesAll (Leader Heartbeat is not periodic, the heartbeat is called just once,
+                // and it runs a fixedRate scheduled future)
+                // OR an appendEntriesCancel can be called on in the leader's heartbeat implementation, at the beginning
+                if(raftObj.getCurrentState() != Raft.NodeState.LEADER)
+                    this.raftObj.heartbeat(true); // should this heartbeat be called after onNext ?
 
-            // remove entries after prevLogIndex, if they exist
-            if(raftObj.getLog().size() > request.getPrevLogIndex()+1) { // is this if condition necessary ? - Yes
-                log = (ArrayList<LogEntry>) log.subList(request.getPrevLogIndex()+1, log.size());
+            } else { // This else is reached only if the prevLogTerm at prevLogIndex matches or if prevLogIndex = -1
+                System.out.println("Request.PrevLogIndex = " + request.getPrevLogIndex() + " RaftObj.LogSize = " + raftObj.getLog().size());
+
+                // add logic to delete existing log entries after prevLogIndex
+                // (Should this be done in the previous else-if, as we find each mismatch ??)
+                // and append the Leader's log entries
+                ArrayList<LogEntry> log = raftObj.getLog();
+
+                // remove entries after prevLogIndex, if they exist
+                if(raftObj.getLastLogIndex() > request.getPrevLogIndex()) { // is this if condition necessary ? - Yes
+                    try {
+                        log = new ArrayList<LogEntry>(log.subList(request.getPrevLogIndex() + 1, log.size()));
+                    } catch(Exception e) {
+                        System.err.println("Error while sub listing the log");
+                        e.printStackTrace();
+                    }
+                }
+
+                 log.addAll(request.getEntriesList());
+                 raftObj.setLog(log);
+
+                if(request.getCommitIndex() > raftObj.getCommitIndex()) {
+                    raftObj.setCommitIndex(Math.min(request.getCommitIndex(), raftObj.getLastLogIndex()));
+                }
+
+                System.out.println("Cancelling Election! Received Append Entry from " + request.getSenderPort() + "(" + request.getTerm() + ")!");
+                raftObj.logger.info("(" + raftObj.getPORT() + ") : Received Append Entry - [Accepted] Sender(" + request.getSenderPort() + ")  Term = " + request.getTerm() + " Current Term = " + raftObj.getCurrentTerm());
+                response = AppendEntriesResponse.newBuilder()
+                        .setTerm(this.raftObj.getCurrentTerm())
+                        .setSuccess(true)
+                        .setSenderPort(raftObj.getPORT())
+                        .build();
+
+                // This is wrong, this is a receiver ?
+                if(this.raftObj.getCurrentState() == Raft.NodeState.LEADER) {
+                    // cancel the previous heartbeats as a new leader with a higher term has been detected
+                    this.raftObj.cancelAppendEntriesAll();
+                }
+
+                // Update currentTerm to match Leader's term and convert node to Follower state
+                if(raftObj.getCurrentTerm() < request.getTerm()) {
+                    raftObj.setCurrentTerm(request.getTerm());
+                }
+                this.raftObj.setCurrentState(Raft.NodeState.FOLLOWER);
+                this.raftObj.heartbeat(true); // should this heartbeat be called after onNext ?
             }
-
-            log.addAll(request.getEntriesList());
-
-            System.out.println("Cancelling Election! Received Append Entry from " + request.getSenderPort() + "(" + request.getTerm() + ")!");
-            raftObj.logger.info("(" + raftObj.getPORT() + ") : Received Append Entry - [Accepted] Sender(" + request.getSenderPort() + ")  Term = " + request.getTerm() + " Current Term = " + raftObj.getCurrentTerm());
-            response = AppendEntriesResponse.newBuilder()
-                    .setTerm(this.raftObj.getCurrentTerm())
-                    .setSuccess(true)
-                    .setSenderPort(raftObj.getPORT())
-                    .build();
-
-            // This is wrong, this is a receiver ?
-            if(this.raftObj.getCurrentState() == Raft.NodeState.LEADER) {
-                // cancel the previous heartbeats as a new leader with a higher term has been detected
-                this.raftObj.cancelAppendEntriesAll();
-            }
-
-            // Update currentTerm to match Leader's term and convert node to Follower state
-            if(raftObj.getCurrentTerm() < request.getTerm()) {
-                raftObj.setCurrentTerm(request.getTerm());
-            }
-            this.raftObj.setCurrentState(Raft.NodeState.FOLLOWER);
-            this.raftObj.heartbeat(true); // should this heartbeat be called after onNext ?
-        }
+       }
 
         responseObserver.onNext(response);
 //        responseObserver.onCompleted();
@@ -119,10 +148,9 @@ public class RaftRPCService extends RaftRPCServiceGrpc.RaftRPCServiceImplBase {
 
                 // Check if this is correct
                 // if vote granted to a higher term candidate, then update currentTerm to match the Candidate's term
-                // and move to Follower state
                 if(request.getTerm() > raftObj.getCurrentTerm()) {
                     raftObj.setCurrentTerm(request.getTerm());
-                    raftObj.setCurrentState(Raft.NodeState.FOLLOWER);
+//                    raftObj.setCurrentState(Raft.NodeState.FOLLOWER);
                 }
 
                 raftObj.setHasVotedInCurrentTerm(true);

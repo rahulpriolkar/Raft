@@ -44,9 +44,17 @@ public class RaftRPCClient {
                                 raftObject.heartbeat(false);
                             } else {
                                 // decrement nextIndex for the follower node
-                                HashMap<Integer, Integer> nextIndex = raftObject.getNextIndex();
-                                nextIndex.put((int)value.getSenderPort(), nextIndex.get(value.getSenderPort()-1));
-                                raftObject.setNextIndex(nextIndex);
+                                try {
+                                    HashMap<Integer, Integer> nextIndex = raftObject.getNextIndex();
+                                    System.out.println("Before" + nextIndex.get((int)value.getSenderPort()));
+//                                nextIndex.put((int)value.getSenderPort(), nextIndex.get((int)value.getSenderPort())-1);
+                                    nextIndex.put((int) value.getSenderPort(), nextIndex.get((int)value.getSenderPort()) - 1);
+
+                                    raftObject.setNextIndex(nextIndex);
+                                    System.out.println("After" + nextIndex.get((int) value.getSenderPort()));
+                                } catch (Exception e) {
+                                    e.printStackTrace();
+                                }
                             }
                         } else { // AppendEntries Success
 //                             increment nextIndex by the number of log entries appended to the Follower's log
@@ -58,7 +66,7 @@ public class RaftRPCClient {
 
                                 // set matchIndex = nextIndex for the Follower
                                 HashMap<Integer, Integer> matchIndex = raftObject.getMatchIndex();
-                                matchIndex.put((int)value.getSenderPort(), nextIndex.get(value.getSenderPort()));
+                                matchIndex.put((int)value.getSenderPort(), nextIndex.get((int)value.getSenderPort())-1);
                                 raftObject.setMatchIndex(matchIndex);
                             } catch (Exception e) {
                                 e.printStackTrace();
